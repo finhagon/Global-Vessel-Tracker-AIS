@@ -1,0 +1,98 @@
+import websocket
+import json
+import pandas as pd
+import time
+import math
+from datetime import datetime
+from threading import Thread
+
+# --- configuração de acesso a api ---
+API_KEY = "sua chave aqui" 
+lista_navios = {}
+TEMPO_COLETA = 120     # (tempo de coleta pode ser alterado conforme configuração)
+
+# base de Dados Geográfica: Oriente Médio, China e Ásia Portos (podem ser inseridos mais conforme necessidade)
+PORTOS_REF = {
+    # --- Oriente Médio (Expandido) ---
+    "Jebel Ali (AE)": (25.01, 55.06), "Khalifa/Abu Dhabi (AE)": (24.84, 54.62), "Khor Fakkan (AE)": (25.36, 56.36),
+    "Jeddah (SA)": (21.48, 39.17), "King Abdullah (SA)": (22.54, 39.11), "Dammam (SA)": (26.43, 50.10),
+    "Salalah (OM)": (16.94, 54.00), "Sohar (OM)": (24.49, 56.63), "Duqm (OM)": (19.67, 57.70),
+    "Hamad (QA)": (25.26, 51.61), "Shuwaikh (KW)": (29.35, 47.92), "Umm Qasr (IQ)": (30.03, 47.92),
+    "Bandar Abbas (IR)": (27.14, 56.21), "Aqaba (JO)": (29.52, 35.00), "Suez Canal (EG)": (29.93, 32.55),
+
+    # --- China (Principais) ---
+    "Shanghai (CN)": (31.22, 121.48), "Ningbo-Zhoushan (CN)": (29.86, 121.54), "Shenzhen (CN)": (22.50, 113.91),
+    "Qingdao (CN)": (36.06, 120.38), "Tianjin (CN)": (38.96, 117.78), "Hong Kong (HK)": (22.33, 114.12),
+    
+    # --- Ásia Central e Sudeste ---
+    "Singapore (SG)": (1.26, 103.83), "Busan (KR)": (35.10, 129.04), "Port Klang (MY)": (3.00, 101.35),
+    "Colombo (LK)": (6.94, 79.84), "Tokyo (JP)": (35.61, 139.77), "Kaohsiung (TW)": (22.61, 120.30),
+
+    # --- Brasil (Referência) ---
+    "Santos (BR)": (-23.99, -46.30), "Pecém (BR)": (-3.54, -38.80), "Rio de Janeiro(BR)": (-22.87, -43.20)
+}
+
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    R = 6371 
+    dlat, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+def identificar_porto_mais_proximo(lat, lon):
+    menor_dist = float('inf')
+    porto_nome = "Mar Aberto"
+    for nome, coords in PORTOS_REF.items():
+        dist = calcular_distancia(lat, lon, coords[0], coords[1])
+        if dist < menor_dist:
+            menor_dist = dist
+            porto_nome = nome
+    return porto_nome, round(menor_dist, 2)
+
+def on_message(ws, message):
+    try:
+        msg = json.loads(message)
+        meta = msg.get('MetaData', {})
+        mmsi = meta.get('MMSI')
+        
+        if mmsi:
+            lat = float(meta.get('latitude'))
+            lon = float(meta.get('longitude'))
+            porto, dist_km = identificar_porto_mais_proximo(lat, lon)
+            
+            # data/Hora
+            data_raw = meta.get('time_utc', '')
+            try:
+                dt_obj = datetime.strptime(data_raw.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                data_formatada = dt_obj.strftime("%d/%m/%Y %H:%M:%S")
+            except:
+                data_formatada = data_raw
+
+            # velocidade (Knots)
+            sog = meta.get('SOG')
+            velocidade = round(float(sog), 1) if sog is not None else 0.0
+
+            lista_navios[mmsi] = {
+                "Nome_Navio": meta.get('ShipName', 'Identificando...').strip(),
+                "MMSI": mmsi,
+                "Latitude": lat,
+                "Longitude": lon,
+                "Velocidade_Knots": velocidade,
+                "Porto_Proximo": porto,
+                "Distancia_Porto_Km": dist_km,
+                "Data_Hora_Sinal": data_formatada,
+                "Tipo_Navio": msg.get("Message", {}).get("ShipStaticData", {}).get("Type", 0)
+            }
+    except: pass
+
+def on_open(ws):
+    auth = {"APIKey": API_KEY, "BoundingBoxes": [[[-90.0, -180.0], [90.0, 180.0]]]}
+    ws.send(json.dumps(auth))
+
+ws = websocket.WebSocketApp("wss://stream.aisstream.io/v0/stream", on_open=on_open, on_message=on_message)
+wst = Thread(target=ws.run_forever); wst.daemon = True; wst.start()
+time.sleep(TEMPO_COLETA); ws.close()
+
+if lista_navios:
+    dataset = pd.DataFrame(lista_navios.values())
+else:
+    dataset = pd.DataFrame(columns=["Nome_Navio", "MMSI", "Latitude", "Longitude", "Porto_Proximo", "Distancia_Porto_Km", "Data_Hora_Sinal"])
